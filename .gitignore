@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Environments
+.venv/
+venv/
+.env/
+.uv/
+
+# Tests and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
