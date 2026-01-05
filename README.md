@@ -1,83 +1,105 @@
-# Command Actor
+# simple-actor
 
-큐에 커맨드를 쌓아 워커 스레드에서 실행하고, 실행 결과를 제한된 크기로 보관하는 경량 커맨드 실행기입니다.
+**파이썬 표준 라이브러리**만으로 구현한 **경량 Actor 모델** 및 **Work Stealing Actor Pool**입니다.
+복잡한 동시성 제어(Lock, Semaphore 등) 없이, **"메시지 전달(Message Passing)"**과 **"단일 스레드 순차 실행"**을 통해 안전하게 병렬 처리를 수행하는 방법을 학습하기 위한 교육용 프로젝트입니다.
 
-## 구성 요소
-- **Actor** (`actor.Actor`): 워커 스레드, 커맨드 큐, 크기 제한 `OrderedDict` 히스토리를 관리합니다. `start()`, `stop()`, `request_command()` API를 제공합니다.
-- **_Invoker** (`actor._Invoker`): 락으로 실행을 직렬화하고 `CommandResult`(success/data/error)를 반환합니다.
-- **Protocols**
-  - `ContextProtocol`: 컨텍스트 제약을 최소화한 마커 프로토콜.
-  - `CommandProtocol[TCtx]`: `execute/undo/redo`를 정의하는 제네릭 커맨드 프로토콜.
+## 🎯 프로젝트 목표
+이 프로젝트는 다음의 동시성 프로그래밍 개념들을 코드로 직접 구현하고 이해하는 것을 목표로 합니다.
 
-## 동작 요약
-- 커맨드는 `request_command(cmd_instance, ctx, *args, **kwargs)` 형태로 큐에 적재됩니다.
-- 워커 루프는 큐에서 하나씩 꺼내 `_Invoker.invoke`로 실행하고, 결과를 히스토리에 저장합니다.
-- 대기 시간은 `elapsed`를 감안해 `max(backoff, interval - elapsed)`로 계산, CPU 사용과 지연을 균형 잡습니다.
-- 히스토리는 `history_size`로 제한되며 초과 시 가장 오래된 항목부터 삭제합니다.
+1.  **Actor Model**: 상태(State)를 공유하지 않고, 각자 전용 스레드를 가진 Actor들이 메시지(작업)를 주고받으며 협력합니다.
+2.  **Future Pattern**: 비동기 작업의 결과를 `concurrent.futures.Future` 객체를 통해 표준적인 방식으로 조회합니다.
+3.  **Work Stealing**: 일부 워커(Actor)에 작업이 몰릴 때, 유휴 상태인 워커가 작업을 훔쳐와 처리함으로써 전체 처리량을 높입니다.
 
-## 설치 & 실행 환경
-- Python 3.10 (프로젝트 루트의 `.python-version` 참조)
-- 의존성: 표준 라이브러리만 사용 (추가 패키지 없음)
-- 실행은 `uv`로 예시: `uv run .\test\test_multi_actor.py`
+## 📂 패키지 구조 (`simple_actor/`)
 
-## 빠른 시작
+핵심 코드는 `simple_actor` 패키지 내에 있습니다.
+
+- **`actor.py`**: `Actor` 클래스.
+    - 스레드(Thread)와 작업 큐(Deque)를 소유합니다.
+    - `submit()`으로 들어온 함수를 순서대로 실행합니다.
+    - 실행 이력(History)을 저장합니다.
+- **`actor_pool.py`**: `ActorPool` 클래스.
+    - 여러 `Actor`를 생성하고 관리합니다.
+    - **Least Loaded Routing**: 작업을 가장 한가한 Actor에게 배정합니다.
+    - **Work Stealing**: 놀고 있는 Actor가 바쁜 Actor의 작업을 가져옵니다.
+- **`scheduling.py`**: 라우팅 및 스틸링 전략(Strategy) 구현체.
+
+## 🚀 사용 방법
+
+### 1. 단일 Actor 사용하기
+Actor는 내부적으로 작업을 직렬화(Serialize)하여 실행하므로, 함수 내에서 `Lock` 없이도 스레드 안전(Thread-safe)하게 상태를 변경할 수 있습니다.
+
 ```python
-from actor import Actor, CommandProtocol, ContextProtocol, CommandResult
+from simple_actor.actor import Actor
 
-class MyContext(ContextProtocol):
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-class HelloCommand(CommandProtocol[MyContext]):
-    name = "HelloCommand"
-    def execute(self, ctx: MyContext) -> CommandResult:
-        return CommandResult(success=True, data={"msg": f"hello {ctx.name}"})
-    def undo(self, ctx: MyContext) -> CommandResult:
-        return CommandResult(success=True)
-    def redo(self, ctx: MyContext) -> CommandResult:
-        return self.execute(ctx)
-
-actor = Actor(name="Demo", history_size=100, interval=0.1, backoff=0.05)
+# 1. Actor 생성 및 시작
+actor = Actor(name="MyActor")
 actor.start()
-actor.request_command(HelloCommand(), MyContext("world"))
+
+# 2. 작업 정의 (공유 자원 접근 시에도 Lock 불필요)
+counter = 0
+def increment(amount):
+    global counter
+    counter += amount
+    return counter
+
+# 3. 작업 제출 (Future 반환)
+future = actor.submit(increment, 10)
+
+# 4. 결과 확인
+print(f"Result: {future.result()}")  # 10
+
+# 5. 종료
 actor.stop()
 ```
 
-## 주요 API
-- `Actor.start() -> bool`: 워커 스레드를 시작합니다.
-- `Actor.stop() -> bool`: 워커 스레드를 중단하고 종료를 기다립니다.
-- `Actor.request_command(cmd: CommandProtocol, ctx: ContextProtocol, *args, **kwargs)`: 커맨드 실행을 큐에 적재합니다.
-- `Actor.history -> OrderedDict[datetime, CommandResult]`: 실행 결과의 복사본을 반환합니다.
+### 2. Actor Pool 사용하기 (병렬 처리)
+`ActorPool`을 사용하면 여러 Actor에게 작업을 분산시켜 병렬로 처리할 수 있습니다.
 
-## 조정 가능한 값
-- `history_size`: 히스토리에 저장할 최대 실행 결과 수. 초과 시 오래된 항목부터 삭제.
-- `interval`: 워커 루프 목표 주기(초). 실행 시간이 짧으면 이 주기에 맞춰 대기.
-- `backoff`: 최소 대기 시간(초). 큐가 비었을 때 또는 실행이 빨랐을 때의 하한.
-- `join_timeout`: `stop()` 시 워커 스레드 종료를 기다리는 상한(초).
+```python
+import time
+from simple_actor.actor_pool import ActorPool
 
-## 테스트
-- 다중 액터 및 동시 증가 시나리오: [`test/test_multi_actor.py`](test/test_multi_actor.py)
-- 실행: `uv run .\test\test_multi_actor.py`
+def heavy_task(name):
+    time.sleep(0.1)
+    return f"Hello, {name}!"
 
-## 구조도
-```mermaid
-flowchart TB
-    client["클라이언트"] -->|커맨드 + 컨텍스트 + args| queue["커맨드 큐"]
-    queue -->|partial callable| worker["액터 워커"]
-    worker -->|단일 실행 요청| invoker["인보커"]
-    invoker -->|execute / undo / redo 호출| command["커맨드"]
-    command -->|ctx 사용| context["컨텍스트"]
-    invoker -->|CommandResult| history["히스토리 (OrderedDict)"]
-    history -->|history_size 초과 시 제거| prune["오래된 결과 삭제"]
-    worker -. stop_flag .- stop["정지 / 재시작"]
+# Context Manager로 Pool 관리 (자동 start/stop)
+with ActorPool(size=3) as pool:
+    futures = []
+    for i in range(5):
+        # 자동으로 부하가 적은 Actor에게 배정됨
+        f = pool.submit(heavy_task, f"User-{i}")
+        futures.append(f)
+    
+    # 결과 출력
+    for f in futures:
+        print(f.result())
 ```
 
-## 설계 노트
-- `_Invoker`는 내부 락으로 실행을 직렬화해 커맨드가 동시에 같은 리소스를 건드리는 상황을 방지합니다.
-- `_history` 접근은 락으로 보호하며, 외부에는 복사본을 제공해 외부 변조를 막습니다.
-- 워커 스레드는 데몬이 아니므로 `stop()`으로 명시 종료해야 리소스가 정리됩니다.
+## 🧠 핵심 구현 상세 (교육용 노트)
 
-## 추가 예정
-1. 큐 대기와 무관하게 즉시 실행 가능한 긴급 호출 경로
-2. 히스토리 영속화/내보내기 옵션
-3. 실행 결과 메트릭/트레이싱 훅
+### Actor의 동작 원리
+- **Queue & Thread**: 각 Actor는 `collections.deque`와 `threading.Condition`을 사용하여 효율적인 생산자-소비자 패턴을 구현했습니다.
+- **순차 실행**: 큐에서 작업을 하나씩 꺼내 실행하므로, Actor 내부 로직은 단일 스레드 환경처럼 작성할 수 있습니다. (GIL의 이점을 활용하거나, I/O 바운드 작업에서 효율적)
+
+### Work Stealing 알고리즘
+단순히 작업을 나누어 주는 것(Routing)만으로는 실행 시간이 긴 작업 때문에 특정 Actor만 바빠지는 불균형(Skew)을 해결하기 어렵습니다.
+- **Routing**: 작업 제출 시점에는 `LeastLoadedRouting` 전략을 사용하여 대기열이 가장 짧은 Actor를 선택합니다.
+- **Stealing**: Actor가 자신의 큐를 모두 비우면(`idle`), `MostLoadedWorkStealer` 전략을 통해 가장 바쁜 동료 Actor의 큐 앞쪽(Stealable한 작업)을 가져와 실행합니다.
+
+## 🧪 테스트 및 검증
+`pytest`를 통해 동시성 동작을 검증할 수 있습니다.
+
+```bash
+# 전체 테스트 실행
+pytest test/
+
+# 주요 테스트 파일
+# test/test_pure_actor.py : 단일 Actor 기능 검증
+# test/test_actor_pool.py : Pool 라우팅 및 Work Stealing 검증
+```
+
+## 📝 요구 사항
+- Python 3.10+
+- 표준 라이브러리만 사용 (외부 의존성 없음)

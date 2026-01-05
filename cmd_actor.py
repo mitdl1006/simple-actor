@@ -2,10 +2,11 @@ import sys
 
 sys.path.append("./")
 import time
+from enum import Enum, auto
 import logging
 from dataclasses import dataclass, field
 from functools import partial
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Event, Condition
 from queue import Queue, Empty
 from datetime import datetime
 from collections import OrderedDict
@@ -15,6 +16,8 @@ from typing import (
     Protocol,
     Callable,
     Dict,
+    Tuple,
+    List,
     Optional,
     runtime_checkable,
     Generic,
@@ -32,6 +35,19 @@ class CommandResult:
     error: Optional[Exception] = field(default=None)
 
 
+class CommandState(Enum):
+    PENDING = auto()      # 생성 및 실행 대기 중
+    TIMEOUT = auto()      # 실행 시간 초과
+    EXECUTING = auto()    # execute 실행 중
+    UNDOING = auto()      # undo 실행 중
+    REDOING = auto()      # redo 실행 중
+    COMPLETED = auto()    # 정상 완료
+    FAILED = auto()       # 실행 실패
+    CANCELLED = auto()    # 취소됨
+    UNDONE = auto()       # undo 완료
+    REDONE = auto()       # redo 완료
+
+
 @runtime_checkable
 class ContextProtocol(Protocol): ...  # 컨텍스트 제약 최소화..
 
@@ -42,10 +58,50 @@ TCtx = TypeVar("TCtx", bound=ContextProtocol, contravariant=True)
 @runtime_checkable
 class CommandProtocol(Protocol, Generic[TCtx]):
     name: str
+    result: Optional[CommandResult]
+    state: CommandState
 
     def execute(self, ctx: TCtx, *args, **kwargs) -> CommandResult: ...
     def redo(self, ctx: TCtx, *args, **kwargs) -> CommandResult: ...
     def undo(self, ctx: TCtx, *args, **kwargs) -> CommandResult: ...
+
+
+class BaseCommand(CommandProtocol[TCtx]):
+    name: str = "BaseCommand"
+    result: Optional[CommandResult] = None
+    state: CommandState = CommandState.PENDING
+
+    def execute(self, ctx: TCtx, *args, **kwargs) -> CommandResult:
+        raise NotImplementedError("execute 메서드는 서브클래드에서 구현되어야 합니다.")
+
+    def undo(self, ctx: TCtx, *args, **kwargs) -> CommandResult:
+        raise NotImplementedError("undo 메서드는 서브클래드에서 구현되어야 합니다.")
+
+    def redo(self, ctx: TCtx, *args, **kwargs) -> CommandResult:
+        raise NotImplementedError("redo 메서드는 서브클래드에서 구현되어야 합니다.")
+
+class CommandAction(Enum):
+    EXECUTE = auto()
+    UNDO = auto()
+    REDO = auto()
+
+
+@dataclass
+class CommandJob(Generic[TCtx]):
+    cmd: CommandProtocol[TCtx]
+    action: CommandAction
+    ctx: TCtx
+    args: Tuple[Any, ...] = field(default_factory=tuple)
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+    enqueued_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class HistoryEntry(Generic[TCtx]):
+    at: datetime
+    action: CommandAction
+    cmd: CommandProtocol[TCtx]
+    result: CommandResult
 
 
 class _Invoker:
@@ -53,16 +109,16 @@ class _Invoker:
         self._lock = Lock()
         self._name = name  # Actor 이름
 
-    def invoke(self, partial_func: Callable[[], CommandResult]) -> CommandResult:
+    def invoke(self, func: Callable[[Any], Any]) -> Any:
         with self._lock:
             try:
-                _log.info(f"Invoker: [{self._name}] 명령 실행 중...")
-                result = partial_func()
+                _log.info(f"Invoker: [{func.__name__}] 실행 중...")
+                result = func()
             except Exception as exc:
-                _log.error(f"Invoker: [{self._name}] 명령 실행 중 예외 발생 - {exc}")
-                return CommandResult(success=False, error=exc)  # 예외 정보 포함
+                _log.error(f"Invoker: [{func.__name__}] 실행 중 예외 발생 - {exc}")
+                return exc
             else:
-                _log.info(f"Invoker: [{self._name}] 명령 실행 완료 - 결과: {result}")
+                _log.info(f"Invoker: [{func.__name__}] 실행 완료 - 결과: {result}")
                 return result
             # finally:
             #     ...
@@ -78,7 +134,7 @@ class Actor:
         backoff: float = 0.1,
         join_timeout: float = 1.0,
     ) -> None:
-        self._cmd_queue: Queue[Callable[[], CommandResult]] = Queue(maxsize=-1)
+        self._cmd_queue: Queue[Callable[[Any], Any]] = Queue(maxsize=-1)
         self._thread: Optional[Thread] = None
         self._stop_flag: Event = Event()
         self._stop_flag.set()
@@ -88,17 +144,18 @@ class Actor:
         self._join_timeout: float = join_timeout
         self.name: str = name
         self._history_size: int = history_size
-        self._history: OrderedDict[datetime, CommandResult] = OrderedDict()
+        self._history: OrderedDict[datetime, Any] = OrderedDict()
         self._history_lock: Lock = Lock()  # 추가
 
     @property
-    def history(self) -> OrderedDict[datetime, CommandResult]:
+    def history(self) -> OrderedDict[datetime, Any]:
         with self._history_lock:
             return self._history.copy()
 
     def _run(self) -> None:
         while not self._stop_flag.is_set():
-            func: Callable[[], CommandResult]
+            func: Callable[[Any], Any]
+            result: Any | Exception
             sleep_time = self._backoff  # 기본 대기 시간
             try:
                 started_time = time.perf_counter()
@@ -107,11 +164,16 @@ class Actor:
                 except Empty:
                     pass
                 else:
-                    command_result = self._invoker.invoke(partial_func=func)
+                    result = self._invoker.invoke(func=func)
+                    
                     with self._history_lock:  # 히스토리 접근 시 잠금
-                        self._history[datetime.now()] = command_result
+                        now = datetime.now()
+                        self._history[now] = HistoryEntry(
+                            at=now, action=job.action, cmd=job.cmd, result=command_result
+                        )
                         if len(self._history) > self._history_size:
                             self._history.popitem(last=False)
+
                     elapsed_time = time.perf_counter() - started_time
                     sleep_time = max(
                         self._backoff, self._interval - elapsed_time
@@ -173,11 +235,39 @@ class Actor:
             _log.warning(f"{self.__class__.__name__}: 재시작 실패 - 시작 실패")
         _log.info(f"{self.__class__.__name__}: 재시작 완료.")
 
-    def request_command(
+    def _request(
+        self,
+        action: CommandAction,
+        cmd: CommandProtocol[TCtx],
+        ctx: TCtx,
+        *args,
+        **kwargs,
+    ) -> None:
+        self._cmd_queue.put(CommandJob(cmd=cmd, action=action, ctx=ctx, args=args, kwargs=kwargs))
+
+    def request_execute_command(
         self,
         cmd: CommandProtocol[TCtx],
         ctx: TCtx,
         *args,
         **kwargs,
     ) -> None:
-        self._cmd_queue.put(partial(cmd.execute, ctx, *args, **kwargs))
+        self._request(CommandAction.EXECUTE, cmd, ctx, *args, **kwargs)
+
+    def request_undo_command(
+        self,
+        cmd: CommandProtocol[TCtx],
+        ctx: TCtx,
+        *args,
+        **kwargs,
+    ) -> None:
+        self._request(CommandAction.UNDO, cmd, ctx, *args, **kwargs)
+
+    def request_redo_command(
+        self,
+        cmd: CommandProtocol[TCtx],
+        ctx: TCtx,
+        *args,
+        **kwargs,
+    ) -> None:
+        self._request(CommandAction.REDO, cmd, ctx, *args, **kwargs)
